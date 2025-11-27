@@ -33,6 +33,9 @@ except Exception as e:
     print(f"FATAL: Failed to connect to MongoDB. Check MONGODB_URI and IP access: {e}")
     exit()
 
+# Global set to track users currently in the ticket creation process (NEW)
+ACTIVE_TICKET_CREATION = set() 
+
 # --- Bot Initialization ---
 
 intents = discord.Intents.default()
@@ -47,7 +50,6 @@ client = commands.Bot(command_prefix=PREFIX, intents=intents)
 async def get_channel_id(user_id: int) -> Optional[int]:
     """Retrieves the active channel ID for a user from the database."""
     result = TICKETS_COLLECTION.find_one({"_id": user_id})
-    # NOTE: MongoDB often stores large Discord IDs as numbers, so searching by ID (which is an int) is typically fine.
     return result.get("channel_id") if result else None
 
 async def create_ticket_mapping(user_id: int, channel_id: int):
@@ -61,14 +63,14 @@ async def delete_ticket_mapping(user_id: int):
 async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
     """
     Retrieves the user ID associated with a channel ID, checking both int and string types
-    to resolve potential MongoDB data type mismatch issues.
+    to resolve potential MongoDB data type mismatch issues. (FIXED)
     """
     
-    # 1. Try searching for the channel ID as a standard Python integer (how it should be stored)
+    # 1. Try searching for the channel ID as a standard Python integer
     result = TICKETS_COLLECTION.find_one({"channel_id": channel_id}) 
     
     if result is None:
-        # 2. FALLBACK: Try searching for the channel ID as a string (in case MongoDB stored it that way)
+        # 2. FALLBACK: Try searching for the channel ID as a string
         channel_id_str = str(channel_id)
         result = TICKETS_COLLECTION.find_one({"channel_id": channel_id_str})
 
@@ -107,18 +109,24 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # 1. Handle Direct Messages (DMs)
     if isinstance(message.channel, discord.DMChannel):
         await handle_dm_message(message)
     
-    # 2. Process commands (like !reply or !close)
     await client.process_commands(message)
 
 async def handle_dm_message(message: discord.Message):
     user_id = message.author.id
+    
+    # 1. Concurrency Lock Check (Prevents duplicate tickets)
+    if user_id in ACTIVE_TICKET_CREATION:
+        return 
+
+    # 2. Check database for existing ticket
     channel_id = await get_channel_id(user_id) 
 
     if channel_id is None:
+        # Add user to the lock set immediately before creating the ticket
+        ACTIVE_TICKET_CREATION.add(user_id) 
         await create_new_ticket(message)
     else:
         await forward_user_message(message, channel_id)
@@ -127,9 +135,14 @@ async def create_new_ticket(message: discord.Message):
     """Creates a new ticket channel and forwards the first message (Logging Mode)."""
     guild = client.get_guild(GUILD_ID)
     category = discord.utils.get(guild.categories, id=MODMAIL_CATEGORY_ID)
+    user_id = message.author.id # Get the user ID here
     
     if not guild or not category:
         print("ERROR: Guild or Category ID is invalid.")
+        
+        # Release lock on failure
+        if user_id in ACTIVE_TICKET_CREATION:
+            ACTIVE_TICKET_CREATION.remove(user_id)
         return
 
     channel_name = f"consultation-{message.author.id}"
@@ -154,6 +167,11 @@ async def create_new_ticket(message: discord.Message):
 
     except Exception as e:
         print(f"Error creating channel or saving to MongoDB: {e}")
+        
+    finally:
+        # RELEASE THE LOCK: Remove the user from the active set regardless of success/failure
+        if user_id in ACTIVE_TICKET_CREATION:
+            ACTIVE_TICKET_CREATION.remove(user_id)
 
 async def forward_user_message(message: discord.Message, channel_id: int):
     """Forwards a user's reply to the corresponding ticket channel."""
