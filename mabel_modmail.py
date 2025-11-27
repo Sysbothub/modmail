@@ -107,8 +107,8 @@ async def on_ready():
     print(f'Logged in as {client.user} (ID: {client.user.id})')
     print('----------------------------------')
     await client.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.listening, 
-        name="your DMs for a consultation"
+        type=discord.ActivityType.playing, 
+        name="Pokemon Legends Z-A"
     ))
 
 @client.event
