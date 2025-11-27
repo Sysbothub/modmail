@@ -1,1 +1,1 @@
-worker: python mabel_modmail.py
+web: python mabel_modmail.py
