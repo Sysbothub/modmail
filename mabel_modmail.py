@@ -4,8 +4,8 @@ from pymongo import MongoClient
 import os
 import asyncio
 from typing import Optional
-from flask import Flask # <-- NEW
-from threading import Thread # <-- NEW
+from flask import Flask
+from threading import Thread
 
 # --- Configuration & MongoDB Setup ---
 
@@ -42,29 +42,47 @@ intents.guilds = True
 
 client = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-# --- MongoDB Utility Functions (Same as before) ---
+# --- MongoDB Utility Functions ---
+
 async def get_channel_id(user_id: int) -> Optional[int]:
+    """Retrieves the active channel ID for a user from the database."""
     result = TICKETS_COLLECTION.find_one({"_id": user_id})
+    # NOTE: MongoDB often stores large Discord IDs as numbers, so searching by ID (which is an int) is typically fine.
     return result.get("channel_id") if result else None
 
 async def create_ticket_mapping(user_id: int, channel_id: int):
+    """Creates a new ticket mapping in the database."""
     TICKETS_COLLECTION.insert_one({"_id": user_id, "channel_id": channel_id})
 
 async def delete_ticket_mapping(user_id: int):
+    """Deletes a ticket mapping from the database."""
     TICKETS_COLLECTION.delete_one({"_id": user_id})
 
 async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
-    result = TICKETS_COLLECTION.find_one({"channel_id": channel_id})
+    """
+    Retrieves the user ID associated with a channel ID, checking both int and string types
+    to resolve potential MongoDB data type mismatch issues.
+    """
+    
+    # 1. Try searching for the channel ID as a standard Python integer (how it should be stored)
+    result = TICKETS_COLLECTION.find_one({"channel_id": channel_id}) 
+    
+    if result is None:
+        # 2. FALLBACK: Try searching for the channel ID as a string (in case MongoDB stored it that way)
+        channel_id_str = str(channel_id)
+        result = TICKETS_COLLECTION.find_one({"channel_id": channel_id_str})
+
+    # The user ID (_id) should be returned as an integer or long integer
     return result.get("_id") if result else None
 
 
-# --- Flask Server for Render Uptime (NEW) ---
+# --- Flask Server for Render Uptime ---
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    # Render requires this endpoint to confirm the service is alive.
+    # This endpoint is hit by an external service (like UptimeRobot) to keep the bot alive.
     return "Professor Mabel ModMail Worker is Running!"
 
 def run_flask_server():
@@ -73,7 +91,7 @@ def run_flask_server():
     app.run(host='0.0.0.0', port=port)
 
 
-# --- Events and Handlers (Same as before) ---
+# --- Events and Handlers (Observation/Logging Mode) ---
 
 @client.event
 async def on_ready():
@@ -89,9 +107,11 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    # 1. Handle Direct Messages (DMs)
     if isinstance(message.channel, discord.DMChannel):
         await handle_dm_message(message)
     
+    # 2. Process commands (like !reply or !close)
     await client.process_commands(message)
 
 async def handle_dm_message(message: discord.Message):
@@ -104,6 +124,7 @@ async def handle_dm_message(message: discord.Message):
         await forward_user_message(message, channel_id)
 
 async def create_new_ticket(message: discord.Message):
+    """Creates a new ticket channel and forwards the first message (Logging Mode)."""
     guild = client.get_guild(GUILD_ID)
     category = discord.utils.get(guild.categories, id=MODMAIL_CATEGORY_ID)
     
@@ -115,8 +136,10 @@ async def create_new_ticket(message: discord.Message):
     
     try:
         new_channel = await guild.create_text_channel(channel_name, category=category)
+        
         await create_ticket_mapping(message.author.id, new_channel.id)
         
+        # --- Notification to Staff (Log) ---
         mod_role = guild.get_role(MOD_ROLE_ID)
         
         embed = discord.Embed(
@@ -133,6 +156,7 @@ async def create_new_ticket(message: discord.Message):
         print(f"Error creating channel or saving to MongoDB: {e}")
 
 async def forward_user_message(message: discord.Message, channel_id: int):
+    """Forwards a user's reply to the corresponding ticket channel."""
     channel = client.get_channel(channel_id)
     
     if channel:
@@ -144,11 +168,12 @@ async def forward_user_message(message: discord.Message, channel_id: int):
         await channel.send(embed=embed)
 
 
-# --- Staff Commands (Same as before) ---
+# --- Staff Commands (Professor Mabel RP) ---
 
 @client.command(name='reply', aliases=['r'])
 @commands.has_role(MOD_ROLE_ID)
 async def reply_to_ticket(ctx: commands.Context, *, response: str):
+    """Staff command to reply to the user from the ticket channel (RP Mode)."""
     if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
         return await ctx.send(f"❌ This command can only be used in a consultation channel.")
         
@@ -157,6 +182,7 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
     if user_id:
         user = client.get_user(user_id)
         if user:
+            # PROFESSOR MABEL RP STYLING: Hides staff identity
             mabel_response_embed = discord.Embed(
                 description=response,
                 color=discord.Color.blue()
@@ -178,6 +204,7 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
 @client.command(name='close', aliases=['c'])
 @commands.has_role(MOD_ROLE_ID)
 async def close_ticket(ctx: commands.Context):
+    """Staff command to close and delete the ticket channel."""
     if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
         return await ctx.send("❌ This command can only be used in a consultation channel.")
         
