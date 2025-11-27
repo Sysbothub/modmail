@@ -33,7 +33,7 @@ except Exception as e:
     print(f"FATAL: Failed to connect to MongoDB. Check MONGODB_URI and IP access: {e}")
     exit()
 
-# Global set to track users currently in the ticket creation process (NEW)
+# Global set to track users currently in the ticket creation process
 ACTIVE_TICKET_CREATION = set() 
 
 # --- Bot Initialization ---
@@ -48,34 +48,41 @@ client = commands.Bot(command_prefix=PREFIX, intents=intents)
 # --- MongoDB Utility Functions ---
 
 async def get_channel_id(user_id: int) -> Optional[int]:
-    """Retrieves the active channel ID for a user from the database."""
-    result = TICKETS_COLLECTION.find_one({"_id": user_id})
-    return result.get("channel_id") if result else None
+    """Retrieves the active channel ID for a user from the database (searches using string ID)."""
+    # NOTE: We search using the string representation of the user ID
+    result = TICKETS_COLLECTION.find_one({"_id": str(user_id)})
+    
+    # We return the channel ID as an integer, even if stored as string
+    if result and result.get("channel_id"):
+        try:
+            return int(result.get("channel_id"))
+        except ValueError:
+            return None
+    return None
 
 async def create_ticket_mapping(user_id: int, channel_id: int):
-    """Creates a new ticket mapping in the database."""
-    TICKETS_COLLECTION.insert_one({"_id": user_id, "channel_id": channel_id})
+    """Creates a new ticket mapping, FORCING all IDs to be stored as strings."""
+    # FIX: Force string storage to prevent lookup issues
+    TICKETS_COLLECTION.insert_one({"_id": str(user_id), "channel_id": str(channel_id)})
 
 async def delete_ticket_mapping(user_id: int):
-    """Deletes a ticket mapping from the database."""
-    TICKETS_COLLECTION.delete_one({"_id": user_id})
+    """Deletes a ticket mapping from the database (searches using string ID)."""
+    # NOTE: We delete using the string representation of the user ID
+    TICKETS_COLLECTION.delete_one({"_id": str(user_id)})
 
 async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
-    """
-    Retrieves the user ID associated with a channel ID, checking both int and string types
-    to resolve potential MongoDB data type mismatch issues. (FIXED)
-    """
+    """Retrieves the user ID associated with a channel ID, searching with string ID (FIXED)."""
     
-    # 1. Try searching for the channel ID as a standard Python integer
-    result = TICKETS_COLLECTION.find_one({"channel_id": channel_id}) 
-    
-    if result is None:
-        # 2. FALLBACK: Try searching for the channel ID as a string
-        channel_id_str = str(channel_id)
-        result = TICKETS_COLLECTION.find_one({"channel_id": channel_id_str})
+    # We must search using the string representation of the channel ID
+    result = TICKETS_COLLECTION.find_one({"channel_id": str(channel_id)}) 
 
-    # The user ID (_id) should be returned as an integer or long integer
-    return result.get("_id") if result else None
+    if result and result.get("_id"):
+        # The result's _id is the User ID, stored as a string. We convert it back to an integer.
+        try:
+            return int(result.get("_id"))
+        except ValueError:
+            return None
+    return None
 
 
 # --- Flask Server for Render Uptime ---
@@ -119,6 +126,8 @@ async def handle_dm_message(message: discord.Message):
     
     # 1. Concurrency Lock Check (Prevents duplicate tickets)
     if user_id in ACTIVE_TICKET_CREATION:
+        # ASYNCIO.SLEEP ADDED: Gives the original thread a chance to complete its DB operations
+        await asyncio.sleep(0.5) 
         return 
 
     # 2. Check database for existing ticket
@@ -135,7 +144,7 @@ async def create_new_ticket(message: discord.Message):
     """Creates a new ticket channel and forwards the first message (Logging Mode)."""
     guild = client.get_guild(GUILD_ID)
     category = discord.utils.get(guild.categories, id=MODMAIL_CATEGORY_ID)
-    user_id = message.author.id # Get the user ID here
+    user_id = message.author.id
     
     if not guild or not category:
         print("ERROR: Guild or Category ID is invalid.")
@@ -150,7 +159,7 @@ async def create_new_ticket(message: discord.Message):
     try:
         new_channel = await guild.create_text_channel(channel_name, category=category)
         
-        await create_ticket_mapping(message.author.id, new_channel.id)
+        await create_ticket_mapping(message.author.id, new_channel.id) 
         
         # --- Notification to Staff (Log) ---
         mod_role = guild.get_role(MOD_ROLE_ID)
