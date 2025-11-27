@@ -4,6 +4,8 @@ from pymongo import MongoClient
 import os
 import asyncio
 from typing import Optional
+from flask import Flask # <-- NEW
+from threading import Thread # <-- NEW
 
 # --- Configuration & MongoDB Setup ---
 
@@ -22,10 +24,9 @@ except KeyError as e:
 # Connect to MongoDB Atlas
 try:
     cluster = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    # Check connection immediately
     cluster.admin.command('ismaster')
     
-    db = cluster["MabelModMail"]  # Your database name
+    db = cluster["MabelModMail"]
     TICKETS_COLLECTION = db["Tickets"] 
     print("✅ Successfully connected to MongoDB Atlas.")
 except Exception as e:
@@ -41,28 +42,38 @@ intents.guilds = True
 
 client = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-# --- MongoDB Utility Functions ---
-
+# --- MongoDB Utility Functions (Same as before) ---
 async def get_channel_id(user_id: int) -> Optional[int]:
-    """Retrieves the active channel ID for a user from the database."""
     result = TICKETS_COLLECTION.find_one({"_id": user_id})
     return result.get("channel_id") if result else None
 
 async def create_ticket_mapping(user_id: int, channel_id: int):
-    """Creates a new ticket mapping in the database."""
     TICKETS_COLLECTION.insert_one({"_id": user_id, "channel_id": channel_id})
 
 async def delete_ticket_mapping(user_id: int):
-    """Deletes a ticket mapping from the database."""
     TICKETS_COLLECTION.delete_one({"_id": user_id})
 
 async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
-    """Retrieves the user ID associated with a channel ID (for staff commands)."""
     result = TICKETS_COLLECTION.find_one({"channel_id": channel_id})
     return result.get("_id") if result else None
 
 
-# --- Events and Handlers (Observation/Logging Mode) ---
+# --- Flask Server for Render Uptime (NEW) ---
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    # Render requires this endpoint to confirm the service is alive.
+    return "Professor Mabel ModMail Worker is Running!"
+
+def run_flask_server():
+    # Render requires binding to 0.0.0.0 and the PORT environment variable
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
+
+
+# --- Events and Handlers (Same as before) ---
 
 @client.event
 async def on_ready():
@@ -93,7 +104,6 @@ async def handle_dm_message(message: discord.Message):
         await forward_user_message(message, channel_id)
 
 async def create_new_ticket(message: discord.Message):
-    """Creates a new ticket channel and forwards the first message (Logging Mode)."""
     guild = client.get_guild(GUILD_ID)
     category = discord.utils.get(guild.categories, id=MODMAIL_CATEGORY_ID)
     
@@ -105,10 +115,8 @@ async def create_new_ticket(message: discord.Message):
     
     try:
         new_channel = await guild.create_text_channel(channel_name, category=category)
-        
         await create_ticket_mapping(message.author.id, new_channel.id)
         
-        # --- Notification to Staff (Log) ---
         mod_role = guild.get_role(MOD_ROLE_ID)
         
         embed = discord.Embed(
@@ -120,14 +128,11 @@ async def create_new_ticket(message: discord.Message):
         embed.set_footer(text=f"User ID: {message.author.id} | Use {PREFIX}reply")
         
         await new_channel.send(f"{mod_role.mention if mod_role else 'Staff'}, new request:", embed=embed)
-        
-        # NOTE: User confirmation message is intentionally REMOVED for observation/logging mode.
 
     except Exception as e:
         print(f"Error creating channel or saving to MongoDB: {e}")
 
 async def forward_user_message(message: discord.Message, channel_id: int):
-    """Forwards a user's reply to the corresponding ticket channel."""
     channel = client.get_channel(channel_id)
     
     if channel:
@@ -139,12 +144,11 @@ async def forward_user_message(message: discord.Message, channel_id: int):
         await channel.send(embed=embed)
 
 
-# --- Staff Commands (Professor Mabel RP) ---
+# --- Staff Commands (Same as before) ---
 
 @client.command(name='reply', aliases=['r'])
 @commands.has_role(MOD_ROLE_ID)
 async def reply_to_ticket(ctx: commands.Context, *, response: str):
-    """Staff command to reply to the user from the ticket channel (RP Mode)."""
     if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
         return await ctx.send(f"❌ This command can only be used in a consultation channel.")
         
@@ -153,7 +157,6 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
     if user_id:
         user = client.get_user(user_id)
         if user:
-            # PROFESSOR MABEL RP STYLING: Hides staff identity
             mabel_response_embed = discord.Embed(
                 description=response,
                 color=discord.Color.blue()
@@ -175,7 +178,6 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
 @client.command(name='close', aliases=['c'])
 @commands.has_role(MOD_ROLE_ID)
 async def close_ticket(ctx: commands.Context):
-    """Staff command to close and delete the ticket channel."""
     if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
         return await ctx.send("❌ This command can only be used in a consultation channel.")
         
@@ -197,4 +199,11 @@ async def close_ticket(ctx: commands.Context):
 
 # --- Run the Bot ---
 if __name__ == '__main__':
-    client.run(TOKEN)
+    # 1. Start Flask in a background thread to satisfy Render's Web Service requirement
+    Thread(target=run_flask_server).start()
+    
+    # 2. Run the Discord bot in the main thread
+    try:
+        client.run(TOKEN)
+    except Exception as e:
+        print(f"FATAL: Discord Bot failed to run: {e}")
