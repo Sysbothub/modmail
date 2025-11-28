@@ -49,10 +49,8 @@ client = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 async def get_channel_id(user_id: int) -> Optional[int]:
     """Retrieves the active channel ID for a user from the database (searches using string ID)."""
-    # NOTE: We search using the string representation of the user ID
     result = TICKETS_COLLECTION.find_one({"_id": str(user_id)})
     
-    # We return the channel ID as an integer, even if stored as string
     if result and result.get("channel_id"):
         try:
             return int(result.get("channel_id"))
@@ -62,16 +60,14 @@ async def get_channel_id(user_id: int) -> Optional[int]:
 
 async def create_ticket_mapping(user_id: int, channel_id: int):
     """Creates a new ticket mapping, FORCING all IDs to be stored as strings."""
-    # FIX: Force string storage to prevent lookup issues
     TICKETS_COLLECTION.insert_one({"_id": str(user_id), "channel_id": str(channel_id)})
 
 async def delete_ticket_mapping(user_id: int):
     """Deletes a ticket mapping from the database (searches using string ID)."""
-    # NOTE: We delete using the string representation of the user ID
     TICKETS_COLLECTION.delete_one({"_id": str(user_id)})
 
 async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
-    """Retrieves the user ID associated with a channel ID, searching with string ID (FIXED)."""
+    """Retrieves the user ID associated with a channel ID, searching with string ID."""
     
     # We must search using the string representation of the channel ID
     result = TICKETS_COLLECTION.find_one({"channel_id": str(channel_id)}) 
@@ -107,8 +103,8 @@ async def on_ready():
     print(f'Logged in as {client.user} (ID: {client.user.id})')
     print('----------------------------------')
     await client.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.playing, 
-        name="Pokemon Legends Z-A"
+        type=discord.ActivityType.listening, 
+        name="your DMs for a consultation"
     ))
 
 @client.event
@@ -126,7 +122,6 @@ async def handle_dm_message(message: discord.Message):
     
     # 1. Concurrency Lock Check (Prevents duplicate tickets)
     if user_id in ACTIVE_TICKET_CREATION:
-        # ASYNCIO.SLEEP ADDED: Gives the original thread a chance to complete its DB operations
         await asyncio.sleep(0.5) 
         return 
 
@@ -201,8 +196,13 @@ async def forward_user_message(message: discord.Message, channel_id: int):
 @commands.has_role(MOD_ROLE_ID)
 async def reply_to_ticket(ctx: commands.Context, *, response: str):
     """Staff command to reply to the user from the ticket channel (RP Mode)."""
-    if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
-        return await ctx.send(f"❌ This command can only be used in a consultation channel.")
+    
+    # ⚠️ DIAGNOSTIC: Print the channel ID being used for lookup (Check your Render logs!)
+    print(f"DEBUG: Attempting lookup for Channel ID: {ctx.channel.id}")
+    
+    # The category check has been temporarily disabled to isolate the lookup issue.
+    # if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
+    #     return await ctx.send(f"❌ This command can only be used in a consultation channel.")
         
     user_id = await get_user_id_from_channel(ctx.channel.id)
     
