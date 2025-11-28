@@ -22,7 +22,14 @@ except KeyError as e:
 
 # Connect to MongoDB Atlas (Synchronous Client)
 try:
-    cluster = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    # ⚠️ FINAL AGGRESSIVE TIMEOUT SETTINGS ⚠️
+    # This gives the bot up to 15 seconds to connect and retry failed sockets.
+    cluster = MongoClient(
+        MONGODB_URI, 
+        serverSelectionTimeoutMS=15000, 
+        connectTimeoutMS=15000,
+        socketTimeoutMS=15000 
+    )
     cluster.admin.command('ismaster')
     
     db = cluster["MabelModMail"]
@@ -258,13 +265,11 @@ async def close_ticket(ctx: commands.Context):
     if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
         return await ctx.send("❌ This command can only be used in a consultation channel.")
         
-    # We must look up the user ID based on the channel to delete the correct record
     user_id = await get_user_id_from_channel(ctx.channel.id) 
     
     if user_id:
         user = client.get_user(user_id)
         
-        # We delete the mapping using the user_id (as channel_id is deleted when channel is deleted)
         await delete_ticket_mapping(user_id)
 
         if user:
