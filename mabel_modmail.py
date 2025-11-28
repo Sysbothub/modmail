@@ -86,17 +86,19 @@ async def delete_ticket_mapping(user_id: int):
         TICKETS_COLLECTION.delete_one({"user_id": str(user_id)})
     await asyncio.to_thread(delete_doc_sync)
 
-# 🌟 FINAL, MINIMALIST LOOKUP FUNCTION 🌟
 async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
-    """Retrieves the user ID directly using the Channel ID as the primary key (_id), MINIMALIST version."""
+    """Retrieves the user ID directly using the Channel ID as the primary key (_id), with a connection check."""
     
     def fetch_doc_sync():
         """Synchronously executes the find_one."""
         try:
+            # 🌟 PING: Explicitly ping the server to ensure connection is live 🌟
+            cluster.admin.command('ping') 
+            
             # Use find_one directly on the Channel ID string (_id)
             return TICKETS_COLLECTION.find_one({"_id": str(channel_id)})
         except Exception as e:
-            # Catch all connection errors and ensure a clean return
+            # This catches connection pooling errors, timeouts, etc.
             print(f"ERROR: DB lookup failed unexpectedly for channel {channel_id}: {e}")
             return None
             
