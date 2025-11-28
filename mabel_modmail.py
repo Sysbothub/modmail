@@ -48,7 +48,7 @@ client = commands.Bot(command_prefix=PREFIX, intents=intents)
 # --- MongoDB Utility Functions ---
 
 async def get_channel_id(user_id: int) -> Optional[int]:
-    """Retrieves the active channel ID for a user from the database (searches using string ID)."""
+    """Retrieves the active channel ID for a user from the database, searching for the User ID."""
     result = TICKETS_COLLECTION.find_one({"_id": str(user_id)})
     
     if result and result.get("channel_id"):
@@ -66,16 +66,32 @@ async def delete_ticket_mapping(user_id: int):
     """Deletes a ticket mapping from the database (searches using string ID)."""
     TICKETS_COLLECTION.delete_one({"_id": str(user_id)})
 
+# 🌟 FINAL FIX: Aggregation Pipeline for guaranteed string lookup 🌟
 async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
-    """Retrieves the user ID associated with a channel ID, searching with string ID."""
+    """
+    Retrieves the user ID associated with a channel ID, forcing strict string lookup 
+    using the MongoDB aggregation pipeline.
+    """
     
-    # We must search using the string representation of the channel ID
-    result = TICKETS_COLLECTION.find_one({"channel_id": str(channel_id)}) 
-
-    if result and result.get("_id"):
-        # The result's _id is the User ID, stored as a string. We convert it back to an integer.
+    pipeline = [
+        {"$match": {"channel_id": {"$eq": str(channel_id)}}}
+    ]
+    
+    def fetch_doc_sync():
+        """Synchronously executes the aggregation and returns the first result."""
         try:
-            return int(result.get("_id"))
+            result = TICKETS_COLLECTION.aggregate(pipeline)
+            return next(result, None)
+        except Exception as e:
+            # We must use print here, as this is running in a separate thread.
+            print(f"ERROR: Aggregation lookup failed in thread: {e}")
+            return None
+            
+    doc = await asyncio.to_thread(fetch_doc_sync)
+
+    if doc and doc.get("_id"):
+        try:
+            return int(doc.get("_id"))
         except ValueError:
             return None
     return None
@@ -87,11 +103,9 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    # This endpoint is hit by an external service (like UptimeRobot) to keep the bot alive.
     return "Professor Mabel ModMail Worker is Running!"
 
 def run_flask_server():
-    # Render requires binding to 0.0.0.0 and the PORT environment variable
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
 
@@ -102,7 +116,6 @@ def run_flask_server():
 async def on_ready():
     print(f'Logged in as {client.user} (ID: {client.user.id})')
     print('----------------------------------')
-    # 🌟 BOT STATUS UPDATE
     await client.change_presence(activity=discord.Game(name="Pokémon Legends Z-A"))
 
 @client.event
@@ -118,26 +131,19 @@ async def on_message(message):
 async def handle_dm_message(message: discord.Message):
     user_id = message.author.id
     
-    # ⚠️ DIAGNOSTIC START
-    print(f"DEBUG: DM received from user {user_id}. Checking lock status.")
-
     # 1. Concurrency Lock Check (Prevents duplicate tickets)
     if user_id in ACTIVE_TICKET_CREATION:
         await asyncio.sleep(0.5) 
-        print(f"DEBUG: User {user_id} currently locked. Ignoring message.")
         return 
 
     # 2. Check database for existing ticket
     channel_id = await get_channel_id(user_id) 
-    print(f"DEBUG: DB lookup complete. Existing channel ID found: {channel_id}")
 
     if channel_id is None:
         # Add user to the lock set immediately before creating the ticket
         ACTIVE_TICKET_CREATION.add(user_id) 
-        print(f"DEBUG: Starting NEW ticket creation for {user_id}.")
         await create_new_ticket(message)
     else:
-        print(f"DEBUG: Forwarding message to existing channel {channel_id}.")
         await forward_user_message(message, channel_id)
 
 async def create_new_ticket(message: discord.Message):
@@ -147,22 +153,18 @@ async def create_new_ticket(message: discord.Message):
     user_id = message.author.id
     
     if not guild or not category:
-        print("ERROR: Guild or Category ID is invalid.")
+        print("ERROR: Guild or Category ID is invalid. Check GUILD_ID and MODMAIL_CATEGORY_ID.")
         
-        # Release lock on failure
         if user_id in ACTIVE_TICKET_CREATION:
             ACTIVE_TICKET_CREATION.remove(user_id)
-            print(f"DEBUG: Lock released for {user_id} due to invalid configuration.")
         return
 
     channel_name = f"consultation-{message.author.id}"
     
     try:
         new_channel = await guild.create_text_channel(channel_name, category=category)
-        print(f"DEBUG: Channel created successfully: {new_channel.id}. Attempting DB mapping.")
         
         await create_ticket_mapping(message.author.id, new_channel.id) 
-        print(f"DEBUG: DB mapping successful for {user_id}.")
         
         # --- Notification to Staff (Log) ---
         mod_role = guild.get_role(MOD_ROLE_ID)
@@ -181,10 +183,8 @@ async def create_new_ticket(message: discord.Message):
         print(f"FATAL ERROR IN TICKET CREATION: {e}")
         
     finally:
-        # RELEASE THE LOCK: Remove the user from the active set regardless of success/failure
         if user_id in ACTIVE_TICKET_CREATION:
             ACTIVE_TICKET_CREATION.remove(user_id)
-            print(f"DEBUG: Lock successfully released for {user_id}.")
 
 async def forward_user_message(message: discord.Message, channel_id: int):
     """Forwards a user's reply to the corresponding ticket channel."""
@@ -206,16 +206,20 @@ async def forward_user_message(message: discord.Message, channel_id: int):
 async def reply_to_ticket(ctx: commands.Context, *, response: str):
     """Staff command to reply to the user from the ticket channel (RP Mode)."""
     
-    # ⚠️ DIAGNOSTIC: Print the channel ID being used for lookup (Check your Render logs!)
-    print(f"DEBUG: Attempting lookup for Channel ID: {ctx.channel.id}")
+    channel_id = ctx.channel.id
     
-    # The category check is disabled to isolate the lookup issue.
-    # if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
-    #     return await ctx.send(f"❌ This command can only be used in a consultation channel.")
+    # ⚠️ IN-CHANNEL DIAGNOSTIC 1: Report the starting status
+    await ctx.send(f"🔬 Diagnostics: Starting lookup for Channel ID `{channel_id}`. (Searching database for matching user...)")
+    
+    if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
+        return await ctx.send(f"❌ This command can only be used in a consultation channel.")
         
-    user_id = await get_user_id_from_channel(ctx.channel.id)
+    user_id = await get_user_id_from_channel(channel_id)
     
     if user_id:
+        # ⚠️ IN-CHANNEL DIAGNOSTIC 2: Report success
+        await ctx.send(f"✅ Lookup Success! Found User ID: `{user_id}`. Attempting DM...")
+        
         user = client.get_user(user_id)
         if user:
             # PROFESSOR MABEL RP STYLING: Hides staff identity
@@ -235,6 +239,9 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
                 pass 
             return
 
+    # ⚠️ IN-CHANNEL DIAGNOSTIC 3: Report Failure
+    await ctx.send(f"❌ Diagnostic Failure: The database lookup returned no associated User ID for channel `{channel_id}`. The document is missing or the ID is incorrect.")
+    
     await ctx.send("❌ Error: Could not find the associated trainer for this consultation.")
 
 @client.command(name='close', aliases=['c'])
@@ -262,10 +269,8 @@ async def close_ticket(ctx: commands.Context):
 
 # --- Run the Bot ---
 if __name__ == '__main__':
-    # 1. Start Flask in a background thread to satisfy Render's Web Service requirement
     Thread(target=run_flask_server).start()
     
-    # 2. Run the Discord bot in the main thread
     try:
         client.run(TOKEN)
     except Exception as e:
