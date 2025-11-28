@@ -28,7 +28,7 @@ try:
     db = cluster["MabelModMail"]
     TICKETS_COLLECTION = db["Tickets"] 
     
-    # ⚠️ CRITICAL: Ensure an index exists on 'user_id' for fast lookups during ticket creation
+    # CRITICAL: Ensure an index exists on 'user_id' for fast lookups during ticket creation
     TICKETS_COLLECTION.create_index("user_id", unique=True)
     
     print("✅ Successfully connected to MongoDB Atlas and ensured 'user_id' index exists.")
@@ -48,12 +48,11 @@ intents.guilds = True
 
 client = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-# --- MongoDB Utility Functions (Updated to use NEW MODEL: _id is Channel ID) ---
+# --- MongoDB Utility Functions (NEW MODEL: _id is Channel ID) ---
 
 async def get_channel_id(user_id: int) -> Optional[int]:
     """Retrieves the active channel ID for a user by searching the secondary 'user_id' field."""
     def fetch_doc_sync():
-        # Search using the secondary 'user_id' field
         return TICKETS_COLLECTION.find_one({"user_id": str(user_id)})
         
     result = await asyncio.to_thread(fetch_doc_sync)
@@ -80,18 +79,26 @@ async def delete_ticket_mapping(user_id: int):
         TICKETS_COLLECTION.delete_one({"user_id": str(user_id)})
     await asyncio.to_thread(delete_doc_sync)
 
+# 🌟 FINAL, MINIMALIST LOOKUP FUNCTION 🌟
 async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
-    """Retrieves the user ID directly using the Channel ID as the primary key (_id)."""
+    """Retrieves the user ID directly using the Channel ID as the primary key (_id), MINIMALIST version."""
     
     def fetch_doc_sync():
-        # 🌟 FIX: Direct lookup by _id is the fastest and most reliable MongoDB operation
-        return TICKETS_COLLECTION.find_one({"_id": str(channel_id)})
+        """Synchronously executes the find_one."""
+        try:
+            # Use find_one directly on the Channel ID string (_id)
+            return TICKETS_COLLECTION.find_one({"_id": str(channel_id)})
+        except Exception as e:
+            # Catch all connection errors and ensure a clean return
+            print(f"ERROR: DB lookup failed unexpectedly for channel {channel_id}: {e}")
+            return None
             
+    # Run the synchronous fetch in a separate thread
     doc = await asyncio.to_thread(fetch_doc_sync)
 
     if doc and doc.get("user_id"):
         try:
-            # The result's user_id field is the User ID (stored as a string)
+            # Return the user_id field
             return int(doc.get("user_id"))
         except ValueError:
             return None
@@ -212,7 +219,6 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
     if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
         return await ctx.send(f"❌ This command can only be used in a consultation channel.")
         
-    # 🌟 FIX: Direct lookup by Channel ID (_id) is now fast and reliable.
     user_id = await get_user_id_from_channel(channel_id)
     
     if user_id:
@@ -241,6 +247,7 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
                 pass 
             return
 
+    # Final Failure Message
     await ctx.send("❌ Error: Could not find the associated trainer for this consultation. Database lookup failed.")
 
 @client.command(name='close', aliases=['c'])
