@@ -49,7 +49,11 @@ client = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 async def get_channel_id(user_id: int) -> Optional[int]:
     """Retrieves the active channel ID for a user from the database, searching for the User ID."""
-    result = TICKETS_COLLECTION.find_one({"_id": str(user_id)})
+    # This remains synchronous, but is called via 'await' in handle_dm_message
+    def fetch_doc_sync():
+        return TICKETS_COLLECTION.find_one({"_id": str(user_id)})
+        
+    result = await asyncio.to_thread(fetch_doc_sync)
     
     if result and result.get("channel_id"):
         try:
@@ -60,13 +64,17 @@ async def get_channel_id(user_id: int) -> Optional[int]:
 
 async def create_ticket_mapping(user_id: int, channel_id: int):
     """Creates a new ticket mapping, FORCING all IDs to be stored as strings."""
-    TICKETS_COLLECTION.insert_one({"_id": str(user_id), "channel_id": str(channel_id)})
+    def insert_doc_sync():
+        TICKETS_COLLECTION.insert_one({"_id": str(user_id), "channel_id": str(channel_id)})
+    await asyncio.to_thread(insert_doc_sync)
 
 async def delete_ticket_mapping(user_id: int):
     """Deletes a ticket mapping from the database (searches using string ID)."""
-    TICKETS_COLLECTION.delete_one({"_id": str(user_id)})
+    def delete_doc_sync():
+        TICKETS_COLLECTION.delete_one({"_id": str(user_id)})
+    await asyncio.to_thread(delete_doc_sync)
 
-# 🌟 FINAL FIX: Aggregation Pipeline for guaranteed string lookup 🌟
+# Aggregation Pipeline for guaranteed string lookup
 async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
     """
     Retrieves the user ID associated with a channel ID, forcing strict string lookup 
@@ -131,23 +139,26 @@ async def on_message(message):
 async def handle_dm_message(message: discord.Message):
     user_id = message.author.id
     
-    # 1. Concurrency Lock Check (Prevents duplicate tickets)
-    if user_id in ACTIVE_TICKET_CREATION:
-        await asyncio.sleep(0.5) 
-        return 
-
-    # 2. Check database for existing ticket
+    # Check database for existing ticket
     channel_id = await get_channel_id(user_id) 
 
     if channel_id is None:
-        # Add user to the lock set immediately before creating the ticket
+        # Check concurrency lock BEFORE creating a new ticket
+        if user_id in ACTIVE_TICKET_CREATION:
+            # The lock is active, ignore the message. The other message is creating the ticket.
+            return 
+        
+        # 💡 FINAL FIX: Add user to the lock set immediately before any await call in create_new_ticket
+        # This prevents the second message from starting ticket creation
         ACTIVE_TICKET_CREATION.add(user_id) 
+        
         await create_new_ticket(message)
     else:
+        # Ticket already exists, just forward the message
         await forward_user_message(message, channel_id)
 
 async def create_new_ticket(message: discord.Message):
-    """Creates a new ticket channel and forwards the first message (Logging Mode)."""
+    """Creates a new ticket channel and forwards the first message."""
     guild = client.get_guild(GUILD_ID)
     category = discord.utils.get(guild.categories, id=MODMAIL_CATEGORY_ID)
     user_id = message.author.id
@@ -164,9 +175,10 @@ async def create_new_ticket(message: discord.Message):
     try:
         new_channel = await guild.create_text_channel(channel_name, category=category)
         
+        # Map the new channel ID to the user ID
         await create_ticket_mapping(message.author.id, new_channel.id) 
         
-        # --- Notification to Staff (Log) ---
+        # --- Notification to Staff ---
         mod_role = guild.get_role(MOD_ROLE_ID)
         
         embed = discord.Embed(
@@ -183,6 +195,7 @@ async def create_new_ticket(message: discord.Message):
         print(f"FATAL ERROR IN TICKET CREATION: {e}")
         
     finally:
+        # Ensure the lock is always removed when the creation process is complete
         if user_id in ACTIVE_TICKET_CREATION:
             ACTIVE_TICKET_CREATION.remove(user_id)
 
@@ -203,13 +216,11 @@ async def forward_user_message(message: discord.Message, channel_id: int):
 
 @client.command(name='reply', aliases=['r'])
 @commands.has_role(MOD_ROLE_ID)
+@commands.guild_only() 
 async def reply_to_ticket(ctx: commands.Context, *, response: str):
     """Staff command to reply to the user from the ticket channel (RP Mode)."""
     
     channel_id = ctx.channel.id
-    
-    # ⚠️ IN-CHANNEL DIAGNOSTIC 1: Report the starting status
-    await ctx.send(f"🔬 Diagnostics: Starting lookup for Channel ID `{channel_id}`. (Searching database for matching user...)")
     
     if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
         return await ctx.send(f"❌ This command can only be used in a consultation channel.")
@@ -217,8 +228,6 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
     user_id = await get_user_id_from_channel(channel_id)
     
     if user_id:
-        # ⚠️ IN-CHANNEL DIAGNOSTIC 2: Report success
-        await ctx.send(f"✅ Lookup Success! Found User ID: `{user_id}`. Attempting DM...")
         
         user = client.get_user(user_id)
         if user:
@@ -231,6 +240,9 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
             
             await user.send(embed=mabel_response_embed)
             
+            # Add a short delay to stabilize the Discord event loop after a DM send
+            await asyncio.sleep(1)
+            
             await ctx.send(f"✅ Response sent to {user.display_name} (Replied by {ctx.author.display_name})")
             
             try:
@@ -239,13 +251,13 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
                 pass 
             return
 
-    # ⚠️ IN-CHANNEL DIAGNOSTIC 3: Report Failure
-    await ctx.send(f"❌ Diagnostic Failure: The database lookup returned no associated User ID for channel `{channel_id}`. The document is missing or the ID is incorrect.")
-    
+    # Diagnostic Failure message (Only runs if lookup failed)
+    await ctx.send(f"❌ Database Lookup Failure: The document for channel `{channel_id}` is missing or the database connection timed out.")
     await ctx.send("❌ Error: Could not find the associated trainer for this consultation.")
 
 @client.command(name='close', aliases=['c'])
 @commands.has_role(MOD_ROLE_ID)
+@commands.guild_only() 
 async def close_ticket(ctx: commands.Context):
     """Staff command to close and delete the ticket channel."""
     if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
