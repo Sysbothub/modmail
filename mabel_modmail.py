@@ -20,27 +20,33 @@ except KeyError as e:
     print(f"FATAL: Missing environment variable: {e}")
     exit()
 
+# Global variables for connection setup
+DB_NAME = "MabelModMail"
+TICKETS_COLLECTION_NAME = "Tickets"
+GLOBAL_CLUSTER = None
+TICKETS_COLLECTION = None
+
 # Connect to MongoDB Atlas (Synchronous Client)
 try:
-    # ⚠️ FINAL AGGRESSIVE TIMEOUT SETTINGS ⚠️
-    # This gives the bot up to 15 seconds to connect and retry failed sockets.
-    cluster = MongoClient(
+    # Set aggressive timeouts for the initial global cluster object
+    GLOBAL_CLUSTER = MongoClient(
         MONGODB_URI, 
         serverSelectionTimeoutMS=15000, 
         connectTimeoutMS=15000,
         socketTimeoutMS=15000 
     )
-    cluster.admin.command('ismaster')
+    GLOBAL_CLUSTER.admin.command('ismaster')
     
-    db = cluster["MabelModMail"]
-    TICKETS_COLLECTION = db["Tickets"] 
+    db = GLOBAL_CLUSTER[DB_NAME]
+    TICKETS_COLLECTION = db[TICKETS_COLLECTION_NAME] 
     
     # CRITICAL: Ensure an index exists on 'user_id' for fast lookups during ticket creation
     TICKETS_COLLECTION.create_index("user_id", unique=True)
     
     print("✅ Successfully connected to MongoDB Atlas and ensured 'user_id' index exists.")
 except Exception as e:
-    print(f"FATAL: Failed to connect to MongoDB. Check MONGODB_URI and IP access: {e}")
+    print(f"FATAL: Failed to connect to MongoDB on startup. Check MONGODB_URI and IP access: {e}")
+    # We still exit here, as the bot is non-functional without the initial connection.
     exit()
 
 # Global set to track users currently in the ticket creation process
@@ -55,7 +61,7 @@ intents.guilds = True
 
 client = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-# --- MongoDB Utility Functions (NEW MODEL: _id is Channel ID) ---
+# --- MongoDB Utility Functions ---
 
 async def get_channel_id(user_id: int) -> Optional[int]:
     """Retrieves the active channel ID for a user by searching the secondary 'user_id' field."""
@@ -64,7 +70,6 @@ async def get_channel_id(user_id: int) -> Optional[int]:
         
     result = await asyncio.to_thread(fetch_doc_sync)
     
-    # The result's _id is the Channel ID in the new model
     if result and result.get("_id"): 
         try:
             return int(result.get("_id"))
@@ -75,31 +80,45 @@ async def get_channel_id(user_id: int) -> Optional[int]:
 async def create_ticket_mapping(user_id: int, channel_id: int):
     """Creates a new ticket mapping (Channel ID is the primary key _id)."""
     def insert_doc_sync():
-        # _id is Channel ID, user_id is the secondary field
         TICKETS_COLLECTION.insert_one({"_id": str(channel_id), "user_id": str(user_id)})
     await asyncio.to_thread(insert_doc_sync)
 
 async def delete_ticket_mapping(user_id: int):
     """Deletes a ticket mapping using the user_id field."""
     def delete_doc_sync():
-        # Find the document using user_id field and delete it
         TICKETS_COLLECTION.delete_one({"user_id": str(user_id)})
     await asyncio.to_thread(delete_doc_sync)
 
 async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
-    """Retrieves the user ID directly using the Channel ID as the primary key (_id), with a connection check."""
+    """
+    Retrieves the user ID directly using the Channel ID as the primary key (_id).
+    
+    ⚠️ FIX: Creates a fresh, localized connection for every lookup.
+    """
     
     def fetch_doc_sync():
-        """Synchronously executes the find_one."""
+        """
+        Synchronously executes the find_one with a fresh connection.
+        This isolates the lookup from the main global cluster's potential breakdown.
+        """
+        # 🌟 THE FINAL FIX ATTEMPT: OPEN A NEW CONNECTION JUST FOR THIS LOOKUP 🌟
         try:
-            # 🌟 PING: Explicitly ping the server to ensure connection is live 🌟
-            cluster.admin.command('ping') 
+            # Re-initialize a MongoClient locally in the thread
+            local_cluster = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+            local_db = local_cluster[DB_NAME]
+            local_collection = local_db[TICKETS_COLLECTION_NAME]
             
             # Use find_one directly on the Channel ID string (_id)
-            return TICKETS_COLLECTION.find_one({"_id": str(channel_id)})
+            doc = local_collection.find_one({"_id": str(channel_id)})
+            
+            # Close the connection immediately to release resources
+            local_cluster.close() 
+            
+            return doc
+            
         except Exception as e:
-            # This catches connection pooling errors, timeouts, etc.
-            print(f"ERROR: DB lookup failed unexpectedly for channel {channel_id}: {e}")
+            # Catch all connection errors
+            print(f"FATAL ERROR: DB lookup failed on fresh connection for channel {channel_id}: {e}")
             return None
             
     # Run the synchronous fetch in a separate thread
