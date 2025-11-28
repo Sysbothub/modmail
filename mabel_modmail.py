@@ -4,8 +4,9 @@ from pymongo import MongoClient
 import os
 import asyncio
 from typing import Optional
-from threading import Thread
+from threading import Thread, Event
 from flask import Flask
+import concurrent.futures
 
 # --- Configuration & MongoDB Setup ---
 
@@ -23,8 +24,13 @@ except KeyError as e:
 # Global variables for connection setup
 DB_NAME = "MabelModMail"
 TICKETS_COLLECTION_NAME = "Tickets"
+# GLOBAL_CLUSTER and TICKETS_COLLECTION are maintained for the faster DM and other simple ops
 GLOBAL_CLUSTER = None
 TICKETS_COLLECTION = None
+
+# Thread pool for concurrent operations outside of the main loop
+THREAD_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+
 
 # Connect to MongoDB Atlas (Synchronous Client)
 try:
@@ -40,13 +46,11 @@ try:
     db = GLOBAL_CLUSTER[DB_NAME]
     TICKETS_COLLECTION = db[TICKETS_COLLECTION_NAME] 
     
-    # CRITICAL: Ensure an index exists on 'user_id' for fast lookups during ticket creation
     TICKETS_COLLECTION.create_index("user_id", unique=True)
     
     print("✅ Successfully connected to MongoDB Atlas and ensured 'user_id' index exists.")
 except Exception as e:
     print(f"FATAL: Failed to connect to MongoDB on startup. Check MONGODB_URI and IP access: {e}")
-    # We still exit here, as the bot is non-functional without the initial connection.
     exit()
 
 # Global set to track users currently in the ticket creation process
@@ -63,12 +67,15 @@ client = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 # --- MongoDB Utility Functions ---
 
+async def run_in_thread(func, *args):
+    """Utility to run any synchronous function in the dedicated thread pool."""
+    return await asyncio.get_event_loop().run_in_executor(THREAD_POOL, func, *args)
+
 async def get_channel_id(user_id: int) -> Optional[int]:
-    """Retrieves the active channel ID for a user by searching the secondary 'user_id' field."""
     def fetch_doc_sync():
         return TICKETS_COLLECTION.find_one({"user_id": str(user_id)})
         
-    result = await asyncio.to_thread(fetch_doc_sync)
+    result = await run_in_thread(fetch_doc_sync)
     
     if result and result.get("_id"): 
         try:
@@ -78,32 +85,29 @@ async def get_channel_id(user_id: int) -> Optional[int]:
     return None
 
 async def create_ticket_mapping(user_id: int, channel_id: int):
-    """Creates a new ticket mapping (Channel ID is the primary key _id)."""
     def insert_doc_sync():
         TICKETS_COLLECTION.insert_one({"_id": str(channel_id), "user_id": str(user_id)})
-    await asyncio.to_thread(insert_doc_sync)
+    await run_in_thread(insert_doc_sync)
 
 async def delete_ticket_mapping(user_id: int):
-    """Deletes a ticket mapping using the user_id field."""
     def delete_doc_sync():
         TICKETS_COLLECTION.delete_one({"user_id": str(user_id)})
-    await asyncio.to_thread(delete_doc_sync)
+    await run_in_thread(delete_doc_sync)
 
 async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
     """
     Retrieves the user ID directly using the Channel ID as the primary key (_id).
     
-    ⚠️ FIX: Creates a fresh, localized connection for every lookup.
+    ⚠️ FIX: Uses a fresh, localized connection inside the thread pool for ultimate stability.
     """
     
-    def fetch_doc_sync():
+    def fetch_doc_sync_isolated():
         """
         Synchronously executes the find_one with a fresh connection.
-        This isolates the lookup from the main global cluster's potential breakdown.
+        This is the most robust way to ensure the main thread failure is bypassed.
         """
-        # 🌟 THE FINAL FIX ATTEMPT: OPEN A NEW CONNECTION JUST FOR THIS LOOKUP 🌟
         try:
-            # Re-initialize a MongoClient locally in the thread
+            # Re-initialize a MongoClient locally in the thread with a short timeout
             local_cluster = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
             local_db = local_cluster[DB_NAME]
             local_collection = local_db[TICKETS_COLLECTION_NAME]
@@ -117,16 +121,15 @@ async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
             return doc
             
         except Exception as e:
-            # Catch all connection errors
-            print(f"FATAL ERROR: DB lookup failed on fresh connection for channel {channel_id}: {e}")
+            # 🌟 This is the FINAL print check for the log 🌟
+            print(f"FATAL ERROR (Threaded Lookup Failure): DB lookup failed for channel {channel_id}: {e}")
             return None
             
-    # Run the synchronous fetch in a separate thread
-    doc = await asyncio.to_thread(fetch_doc_sync)
+    # Run the isolated fetch in the dedicated thread pool
+    doc = await run_in_thread(fetch_doc_sync_isolated)
 
     if doc and doc.get("user_id"):
         try:
-            # Return the user_id field
             return int(doc.get("user_id"))
         except ValueError:
             return None
@@ -198,10 +201,8 @@ async def create_new_ticket(message: discord.Message):
     try:
         new_channel = await guild.create_text_channel(channel_name, category=category)
         
-        # Map the new channel ID to the user ID (NEW MODEL: channel_id is _id)
         await create_ticket_mapping(message.author.id, new_channel.id) 
         
-        # --- Notification to Staff ---
         mod_role = guild.get_role(MOD_ROLE_ID)
         
         embed = discord.Embed(
@@ -240,7 +241,6 @@ async def forward_user_message(message: discord.Message, channel_id: int):
 @commands.has_role(MOD_ROLE_ID)
 @commands.guild_only() 
 async def reply_to_ticket(ctx: commands.Context, *, response: str):
-    """Staff command to reply to the user from the ticket channel (RP Mode)."""
     
     channel_id = ctx.channel.id
     
@@ -253,7 +253,6 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
         
         user = client.get_user(user_id)
         if user:
-            # PROFESSOR MABEL RP STYLING: Hides staff identity
             mabel_response_embed = discord.Embed(
                 description=response,
                 color=discord.Color.blue()
@@ -275,14 +274,12 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
                 pass 
             return
 
-    # Final Failure Message
     await ctx.send("❌ Error: Could not find the associated trainer for this consultation. Database lookup failed.")
 
 @client.command(name='close', aliases=['c'])
 @commands.has_role(MOD_ROLE_ID)
 @commands.guild_only() 
 async def close_ticket(ctx: commands.Context):
-    """Staff command to close and delete the ticket channel."""
     if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
         return await ctx.send("❌ This command can only be used in a consultation channel.")
         
