@@ -102,10 +102,8 @@ def run_flask_server():
 async def on_ready():
     print(f'Logged in as {client.user} (ID: {client.user.id})')
     print('----------------------------------')
-    await client.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.listening, 
-        name="your DMs for a consultation"
-    ))
+    # 🌟 BOT STATUS UPDATE
+    await client.change_presence(activity=discord.Game(name="Pokémon Legends Z-A"))
 
 @client.event
 async def on_message(message):
@@ -120,19 +118,26 @@ async def on_message(message):
 async def handle_dm_message(message: discord.Message):
     user_id = message.author.id
     
+    # ⚠️ DIAGNOSTIC START
+    print(f"DEBUG: DM received from user {user_id}. Checking lock status.")
+
     # 1. Concurrency Lock Check (Prevents duplicate tickets)
     if user_id in ACTIVE_TICKET_CREATION:
         await asyncio.sleep(0.5) 
+        print(f"DEBUG: User {user_id} currently locked. Ignoring message.")
         return 
 
     # 2. Check database for existing ticket
     channel_id = await get_channel_id(user_id) 
+    print(f"DEBUG: DB lookup complete. Existing channel ID found: {channel_id}")
 
     if channel_id is None:
         # Add user to the lock set immediately before creating the ticket
         ACTIVE_TICKET_CREATION.add(user_id) 
+        print(f"DEBUG: Starting NEW ticket creation for {user_id}.")
         await create_new_ticket(message)
     else:
+        print(f"DEBUG: Forwarding message to existing channel {channel_id}.")
         await forward_user_message(message, channel_id)
 
 async def create_new_ticket(message: discord.Message):
@@ -147,14 +152,17 @@ async def create_new_ticket(message: discord.Message):
         # Release lock on failure
         if user_id in ACTIVE_TICKET_CREATION:
             ACTIVE_TICKET_CREATION.remove(user_id)
+            print(f"DEBUG: Lock released for {user_id} due to invalid configuration.")
         return
 
     channel_name = f"consultation-{message.author.id}"
     
     try:
         new_channel = await guild.create_text_channel(channel_name, category=category)
+        print(f"DEBUG: Channel created successfully: {new_channel.id}. Attempting DB mapping.")
         
         await create_ticket_mapping(message.author.id, new_channel.id) 
+        print(f"DEBUG: DB mapping successful for {user_id}.")
         
         # --- Notification to Staff (Log) ---
         mod_role = guild.get_role(MOD_ROLE_ID)
@@ -170,12 +178,13 @@ async def create_new_ticket(message: discord.Message):
         await new_channel.send(f"{mod_role.mention if mod_role else 'Staff'}, new request:", embed=embed)
 
     except Exception as e:
-        print(f"Error creating channel or saving to MongoDB: {e}")
+        print(f"FATAL ERROR IN TICKET CREATION: {e}")
         
     finally:
         # RELEASE THE LOCK: Remove the user from the active set regardless of success/failure
         if user_id in ACTIVE_TICKET_CREATION:
             ACTIVE_TICKET_CREATION.remove(user_id)
+            print(f"DEBUG: Lock successfully released for {user_id}.")
 
 async def forward_user_message(message: discord.Message, channel_id: int):
     """Forwards a user's reply to the corresponding ticket channel."""
@@ -200,7 +209,7 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
     # ⚠️ DIAGNOSTIC: Print the channel ID being used for lookup (Check your Render logs!)
     print(f"DEBUG: Attempting lookup for Channel ID: {ctx.channel.id}")
     
-    # The category check has been temporarily disabled to isolate the lookup issue.
+    # The category check is disabled to isolate the lookup issue.
     # if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
     #     return await ctx.send(f"❌ This command can only be used in a consultation channel.")
         
