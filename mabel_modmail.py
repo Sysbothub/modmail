@@ -4,12 +4,11 @@ from pymongo import MongoClient
 import os
 import asyncio
 from typing import Optional
-from flask import Flask
 from threading import Thread
+from flask import Flask
 
 # --- Configuration & MongoDB Setup ---
 
-# Load configuration from environment variables
 try:
     TOKEN = os.environ['DISCORD_TOKEN']
     GUILD_ID = int(os.environ['GUILD_ID'])
@@ -21,14 +20,18 @@ except KeyError as e:
     print(f"FATAL: Missing environment variable: {e}")
     exit()
 
-# Connect to MongoDB Atlas
+# Connect to MongoDB Atlas (Synchronous Client)
 try:
     cluster = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
     cluster.admin.command('ismaster')
     
     db = cluster["MabelModMail"]
     TICKETS_COLLECTION = db["Tickets"] 
-    print("✅ Successfully connected to MongoDB Atlas.")
+    
+    # ⚠️ CRITICAL: Ensure an index exists on 'user_id' for fast lookups during ticket creation
+    TICKETS_COLLECTION.create_index("user_id", unique=True)
+    
+    print("✅ Successfully connected to MongoDB Atlas and ensured 'user_id' index exists.")
 except Exception as e:
     print(f"FATAL: Failed to connect to MongoDB. Check MONGODB_URI and IP access: {e}")
     exit()
@@ -45,61 +48,51 @@ intents.guilds = True
 
 client = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-# --- MongoDB Utility Functions ---
+# --- MongoDB Utility Functions (Updated to use NEW MODEL: _id is Channel ID) ---
 
 async def get_channel_id(user_id: int) -> Optional[int]:
-    """Retrieves the active channel ID for a user from the database, searching for the User ID."""
-    # This remains synchronous, but is called via 'await' in handle_dm_message
+    """Retrieves the active channel ID for a user by searching the secondary 'user_id' field."""
     def fetch_doc_sync():
-        return TICKETS_COLLECTION.find_one({"_id": str(user_id)})
+        # Search using the secondary 'user_id' field
+        return TICKETS_COLLECTION.find_one({"user_id": str(user_id)})
         
     result = await asyncio.to_thread(fetch_doc_sync)
     
-    if result and result.get("channel_id"):
+    # The result's _id is the Channel ID in the new model
+    if result and result.get("_id"): 
         try:
-            return int(result.get("channel_id"))
+            return int(result.get("_id"))
         except ValueError:
             return None
     return None
 
 async def create_ticket_mapping(user_id: int, channel_id: int):
-    """Creates a new ticket mapping, FORCING all IDs to be stored as strings."""
+    """Creates a new ticket mapping (Channel ID is the primary key _id)."""
     def insert_doc_sync():
-        TICKETS_COLLECTION.insert_one({"_id": str(user_id), "channel_id": str(channel_id)})
+        # _id is Channel ID, user_id is the secondary field
+        TICKETS_COLLECTION.insert_one({"_id": str(channel_id), "user_id": str(user_id)})
     await asyncio.to_thread(insert_doc_sync)
 
 async def delete_ticket_mapping(user_id: int):
-    """Deletes a ticket mapping from the database (searches using string ID)."""
+    """Deletes a ticket mapping using the user_id field."""
     def delete_doc_sync():
-        TICKETS_COLLECTION.delete_one({"_id": str(user_id)})
+        # Find the document using user_id field and delete it
+        TICKETS_COLLECTION.delete_one({"user_id": str(user_id)})
     await asyncio.to_thread(delete_doc_sync)
 
-# Aggregation Pipeline for guaranteed string lookup
 async def get_user_id_from_channel(channel_id: int) -> Optional[int]:
-    """
-    Retrieves the user ID associated with a channel ID, forcing strict string lookup 
-    using the MongoDB aggregation pipeline.
-    """
-    
-    pipeline = [
-        {"$match": {"channel_id": {"$eq": str(channel_id)}}}
-    ]
+    """Retrieves the user ID directly using the Channel ID as the primary key (_id)."""
     
     def fetch_doc_sync():
-        """Synchronously executes the aggregation and returns the first result."""
-        try:
-            result = TICKETS_COLLECTION.aggregate(pipeline)
-            return next(result, None)
-        except Exception as e:
-            # We must use print here, as this is running in a separate thread.
-            print(f"ERROR: Aggregation lookup failed in thread: {e}")
-            return None
+        # 🌟 FIX: Direct lookup by _id is the fastest and most reliable MongoDB operation
+        return TICKETS_COLLECTION.find_one({"_id": str(channel_id)})
             
     doc = await asyncio.to_thread(fetch_doc_sync)
 
-    if doc and doc.get("_id"):
+    if doc and doc.get("user_id"):
         try:
-            return int(doc.get("_id"))
+            # The result's user_id field is the User ID (stored as a string)
+            return int(doc.get("user_id"))
         except ValueError:
             return None
     return None
@@ -118,7 +111,7 @@ def run_flask_server():
     app.run(host='0.0.0.0', port=port)
 
 
-# --- Events and Handlers (Observation/Logging Mode) ---
+# --- Events and Handlers ---
 
 @client.event
 async def on_ready():
@@ -139,22 +132,17 @@ async def on_message(message):
 async def handle_dm_message(message: discord.Message):
     user_id = message.author.id
     
-    # Check database for existing ticket
     channel_id = await get_channel_id(user_id) 
 
     if channel_id is None:
-        # Check concurrency lock BEFORE creating a new ticket
+        
         if user_id in ACTIVE_TICKET_CREATION:
-            # The lock is active, ignore the message. The other message is creating the ticket.
             return 
         
-        # 💡 FINAL FIX: Add user to the lock set immediately before any await call in create_new_ticket
-        # This prevents the second message from starting ticket creation
         ACTIVE_TICKET_CREATION.add(user_id) 
         
         await create_new_ticket(message)
     else:
-        # Ticket already exists, just forward the message
         await forward_user_message(message, channel_id)
 
 async def create_new_ticket(message: discord.Message):
@@ -175,7 +163,7 @@ async def create_new_ticket(message: discord.Message):
     try:
         new_channel = await guild.create_text_channel(channel_name, category=category)
         
-        # Map the new channel ID to the user ID
+        # Map the new channel ID to the user ID (NEW MODEL: channel_id is _id)
         await create_ticket_mapping(message.author.id, new_channel.id) 
         
         # --- Notification to Staff ---
@@ -195,7 +183,6 @@ async def create_new_ticket(message: discord.Message):
         print(f"FATAL ERROR IN TICKET CREATION: {e}")
         
     finally:
-        # Ensure the lock is always removed when the creation process is complete
         if user_id in ACTIVE_TICKET_CREATION:
             ACTIVE_TICKET_CREATION.remove(user_id)
 
@@ -225,6 +212,7 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
     if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
         return await ctx.send(f"❌ This command can only be used in a consultation channel.")
         
+    # 🌟 FIX: Direct lookup by Channel ID (_id) is now fast and reliable.
     user_id = await get_user_id_from_channel(channel_id)
     
     if user_id:
@@ -238,9 +226,11 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
             )
             mabel_response_embed.set_author(name="Professor Mabel", icon_url=client.user.avatar.url if client.user.avatar else None)
             
-            await user.send(embed=mabel_response_embed)
-            
-            # Add a short delay to stabilize the Discord event loop after a DM send
+            try:
+                await user.send(embed=mabel_response_embed)
+            except discord.Forbidden:
+                return await ctx.send("❌ Error: Cannot DM the user. They may have DMs disabled or have blocked the bot.")
+
             await asyncio.sleep(1)
             
             await ctx.send(f"✅ Response sent to {user.display_name} (Replied by {ctx.author.display_name})")
@@ -251,9 +241,7 @@ async def reply_to_ticket(ctx: commands.Context, *, response: str):
                 pass 
             return
 
-    # Diagnostic Failure message (Only runs if lookup failed)
-    await ctx.send(f"❌ Database Lookup Failure: The document for channel `{channel_id}` is missing or the database connection timed out.")
-    await ctx.send("❌ Error: Could not find the associated trainer for this consultation.")
+    await ctx.send("❌ Error: Could not find the associated trainer for this consultation. Database lookup failed.")
 
 @client.command(name='close', aliases=['c'])
 @commands.has_role(MOD_ROLE_ID)
@@ -263,18 +251,21 @@ async def close_ticket(ctx: commands.Context):
     if ctx.channel.category_id != MODMAIL_CATEGORY_ID:
         return await ctx.send("❌ This command can only be used in a consultation channel.")
         
-    user_id = await get_user_id_from_channel(ctx.channel.id)
+    # We must look up the user ID based on the channel to delete the correct record
+    user_id = await get_user_id_from_channel(ctx.channel.id) 
     
     if user_id:
         user = client.get_user(user_id)
+        
+        # We delete the mapping using the user_id (as channel_id is deleted when channel is deleted)
+        await delete_ticket_mapping(user_id)
+
         if user:
             try:
                 await user.send("✅ Professor Mabel has closed your consultation thread. Please DM the bot again to open a new one.")
             except:
                 print(f"Could not DM user {user.id} about closure.")
             
-            await delete_ticket_mapping(user_id)
-
     await ctx.send("🗑️ Consultation thread closing in 5 seconds...")
     await asyncio.sleep(5)
     await ctx.channel.delete()
